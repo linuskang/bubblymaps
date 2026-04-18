@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  app:
+    image: linuskang/bubblymaps:latest
+    container_name: bubblymaps
+    restart: unless-stopped
+    ports:
+      - "7000:3000"
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+    networks:
+      - bubbly-network
+  db:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "7432:5432"
+    environment:
+      POSTGRES_USER: bubblymaps
+      POSTGRES_DB: bubblymaps
+      POSTGRES_PASSWORD: bubblymaps
+      PGDATA: /var/lib/postgresql/data
+
+    volumes:
+      - /opt/services/postgres:/var/lib/postgresql/data
+
+    networks:
+      - bubblymaps
+
+networks:
+  bubblymaps:
+    name: bubbly-network
