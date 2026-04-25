@@ -33,6 +33,7 @@ export default function MapBox({
       style: styleURL,
       center,
       zoom,
+      projection: undefined,
       forceNoAttributionControl: true,
       navigationControl: false,
       geolocateControl: false,
@@ -41,6 +42,52 @@ export default function MapBox({
       terrainControl: false,
       projectionControl: false,
     });
+
+    const rawMigrateProjection = (mapRef.current as any).migrateProjection?.bind(mapRef.current);
+    if (rawMigrateProjection) {
+      // Work around MapLibre crash when style.projection is missing during migration.
+      (mapRef.current as any).migrateProjection = function patchedMigrateProjection(...args: unknown[]) {
+        const ensureProjectionName = () => {
+          const style = (this as any).style;
+          if (!style) return;
+          if (!style.projection) {
+            const fallbackProjection = style.stylesheet?.projection?.type ?? "mercator";
+            style.projection = { name: fallbackProjection };
+          }
+        };
+
+        ensureProjectionName();
+        try {
+          return rawMigrateProjection(...args);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.includes("reading 'name'")) {
+            return;
+          }
+          if (message.includes("Style is not done loading")) {
+            return;
+          }
+          throw error;
+        }
+      };
+    }
+
+    // Patch setTerrain: during style._load it calls setTerrain before the style is
+    // ready, causing an internal "Style is not done loading" throw. Swallow it.
+    const rawSetTerrain = (mapRef.current as any).setTerrain?.bind(mapRef.current);
+    if (rawSetTerrain) {
+      (mapRef.current as any).setTerrain = function patchedSetTerrain(...args: unknown[]) {
+        try {
+          return rawSetTerrain(...args);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.includes("Style is not done loading")) return;
+          throw error;
+        }
+      };
+    }
+
+    mapRef.current.forgetPersistedProjection();
 
     if (showControls) {
       mapRef.current.addControl(new NavigationControl(), "top-right");
@@ -59,11 +106,11 @@ export default function MapBox({
       currentStyleUrl.current = styleURL;
       // Wait for map to be ready before changing style
       if (mapRef.current.isStyleLoaded()) {
-        mapRef.current.setStyle(styleURL);
+        mapRef.current.setStyle(styleURL, { diff: false });
       } else {
         mapRef.current.once('load', () => {
           if (mapRef.current) {
-            mapRef.current.setStyle(styleURL);
+            mapRef.current.setStyle(styleURL, { diff: false });
           }
         });
       }

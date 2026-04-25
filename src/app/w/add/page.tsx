@@ -61,6 +61,7 @@ export default function AddWaypointPage() {
       style: primaryStyle,
       center: [initLng, initLat],
       zoom: 16,
+      projection: undefined,
       forceNoAttributionControl: true,
       navigationControl: false,
       geolocateControl: false,
@@ -69,6 +70,37 @@ export default function AddWaypointPage() {
       terrainControl: false,
       projectionControl: false,
     })
+
+    const rawMigrateProjection = (mapInstance.current as any).migrateProjection?.bind(mapInstance.current)
+    if (rawMigrateProjection) {
+      // Work around MapLibre crash when style.projection is missing during migration.
+      ;(mapInstance.current as any).migrateProjection = function patchedMigrateProjection(...args: unknown[]) {
+        const ensureProjectionName = () => {
+          const style = (this as any).style
+          if (!style) return
+          if (!style.projection) {
+            const fallbackProjection = style.stylesheet?.projection?.type ?? "mercator"
+            style.projection = { name: fallbackProjection }
+          }
+        }
+
+        ensureProjectionName()
+        try {
+          return rawMigrateProjection(...args)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (message.includes("reading 'name'")) {
+            return
+          }
+          if (message.includes("Style is not done loading")) {
+            return
+          }
+          throw error
+        }
+      }
+    }
+
+    mapInstance.current.forgetPersistedProjection()
 
     // if tiles/style fail to load, switch to a public fallback so the map is visible
     const onError = (err: unknown) => {
@@ -151,6 +183,7 @@ export default function AddWaypointPage() {
       style: previewStyle,
       center: [lng, lat],
       zoom: 15,
+      projection: undefined,
       interactive: false, // disable user interaction
       forceNoAttributionControl: true,
       navigationControl: false,
@@ -160,6 +193,37 @@ export default function AddWaypointPage() {
       terrainControl: false,
       projectionControl: false,
     })
+
+    const rawPreviewMigrateProjection = (previewMapInstance.current as any).migrateProjection?.bind(previewMapInstance.current)
+    if (rawPreviewMigrateProjection) {
+      // Work around MapLibre crash when style.projection is missing during migration.
+      ;(previewMapInstance.current as any).migrateProjection = function patchedMigrateProjection(...args: unknown[]) {
+        const ensureProjectionName = () => {
+          const style = (this as any).style
+          if (!style) return
+          if (!style.projection) {
+            const fallbackProjection = style.stylesheet?.projection?.type ?? "mercator"
+            style.projection = { name: fallbackProjection }
+          }
+        }
+
+        ensureProjectionName()
+        try {
+          return rawPreviewMigrateProjection(...args)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (message.includes("reading 'name'")) {
+            return
+          }
+          if (message.includes("Style is not done loading")) {
+            return
+          }
+          throw error
+        }
+      }
+    }
+
+    previewMapInstance.current.forgetPersistedProjection()
 
     // Add a marker at the location
     new Marker({ color: '#3b82f6' })

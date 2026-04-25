@@ -3,13 +3,11 @@
 import "@maptiler/sdk/dist/maptiler-sdk.css";
 import type { Map as MaptilerMap } from "@maptiler/sdk";
 import { GeoJSONSource, Popup } from "@maptiler/sdk";
-
 import ReactDOM from "react-dom/client";
 
 import MapBox from "@/components/map/map";
 import User from "@/components/user";
 import WaypointPopup from "@/components/map/waypoint-popup";
-
 import { ThemeToggle } from "@/components/map/controls/theme-toggle";
 import { Credit } from "@/components/map/credit";
 import { MapZoom } from "@/components/map/controls/map-zoom";
@@ -17,7 +15,6 @@ import { MapScale } from "@/components/map/controls/map-scale";
 import { SearchBar } from "@/components/map/controls/search-bar";
 
 import { toast } from "sonner";
-
 import { useSession } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState, useRef } from "react";
@@ -67,8 +64,8 @@ function getMapStateFromSearchParams(searchParams: URLSearchParams) {
 
 async function getGeoIpCenter(): Promise<[number, number]> {
     try {
-        const response = await fetch("https://ipapi.co/json/");
-        const data = await response.json();
+        const res = await fetch("https://ipapi.co/json/");
+        const data = await res.json();
         const lat = typeof data.latitude === "number" ? data.latitude : parseFloat(data.latitude);
         const lng = typeof data.longitude === "number" ? data.longitude : parseFloat(data.longitude);
         return Number.isNaN(lat) || Number.isNaN(lng) ? DEFAULT_CENTER : [lng, lat];
@@ -78,27 +75,24 @@ async function getGeoIpCenter(): Promise<[number, number]> {
 }
 
 function normalizeBoundingBoxRing(coordinates: BoundingBoxRecord["coordinates"]) {
-    const polygonCoordinates: GeoJSON.Position[][] =
-        Array.isArray(coordinates?.[0]?.[0])
-            ? (coordinates as GeoJSON.Position[][])
-            : [coordinates as GeoJSON.Position[]];
+    const rings: GeoJSON.Position[][] = Array.isArray(coordinates?.[0]?.[0])
+        ? (coordinates as GeoJSON.Position[][])
+        : [coordinates as GeoJSON.Position[]];
 
-    const outerRing = polygonCoordinates[0] ?? [];
-    const normalizedRing = outerRing
+    const outer = rings[0] ?? [];
+    const ring = outer
         .map((pos) => [Number(pos?.[0]), Number(pos?.[1])] as [number, number])
         .filter(([lng, lat]) => Number.isFinite(lng) && Number.isFinite(lat));
 
-    if (normalizedRing.length < 4) return null;
+    if (ring.length < 4) return null;
 
-    const first = normalizedRing[0];
-    const last = normalizedRing[normalizedRing.length - 1];
+    const first = ring[0];
+    const last = ring[ring.length - 1];
     if (!first || !last) return null;
 
-    if (first[0] !== last[0] || first[1] !== last[1]) {
-        normalizedRing.push([first[0], first[1]]);
-    }
+    if (first[0] !== last[0] || first[1] !== last[1]) ring.push([first[0], first[1]]);
 
-    return normalizedRing;
+    return ring;
 }
 
 function MapPage() {
@@ -114,10 +108,14 @@ function MapPage() {
     const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
     const [activePopup, setActivePopup] = useState<Popup | null>(null);
 
-    // ✅ Caching Refs: Stores data immediately to safely redraw layers on theme switch
+    // mapRef mirrors map state so async callbacks can access the latest instance
+    const mapRef = useRef<MaptilerMap | null>(null);
     const boundingBoxesRef = useRef<BoundingBoxRecord[]>([]);
     const waypointGeojsonRef = useRef<GeoJSON.FeatureCollection | null>(null);
-    const initializedLayersRef = useRef<Set<string>>(new Set()); // Tracks events to prevent duplicate popups
+    const dataReadyRef = useRef(false);
+    // Reset on every style.load so event listeners re-register on the new style's layers
+    const registeredEventsRef = useRef<Set<string>>(new Set());
+    const retryTimerRef = useRef<number | null>(null);
 
     const mapStyleUrl = resolvedTheme === "dark" ? MAP_STYLE_DARK : MAP_STYLE_LIGHT;
 
@@ -126,33 +124,34 @@ function MapPage() {
     useEffect(() => {
         const { center, zoom } = getMapStateFromSearchParams(searchParams);
         if (zoom !== null) setMapZoom(zoom);
-
         if (center) {
             setMapCenter(center);
-            return;
+        } else {
+            getGeoIpCenter().then(setMapCenter);
         }
-
-        getGeoIpCenter().then(setMapCenter);
     }, [searchParams]);
 
-    const openPopup = useCallback((coordinates: [number, number], id: number) => {
-        if (!map) return;
+    const handleMapLoad = useCallback((m: MaptilerMap) => {
+        mapRef.current = m;
+        setMap(m);
+    }, []);
 
+    const openPopup = useCallback((coordinates: [number, number], id: number) => {
+        const m = mapRef.current;
+        if (!m) return;
         const el = document.createElement("div");
         ReactDOM.createRoot(el).render(<WaypointPopup coordinates={coordinates} id={id} />);
         const popup = new Popup({ closeButton: false, offset: 14, maxWidth: "none" })
             .setLngLat(coordinates)
             .setDOMContent(el)
-            .addTo(map);
-
+            .addTo(m);
         setActivePopup(popup);
         popup.on("close", () => setActivePopup(null));
-    }, [map]);
+    }, []);
 
-    // ✅ Map coordinate sync effect
+    // Sync map position to URL
     useEffect(() => {
         if (!map) return;
-
         const onMove = () => {
             const { lat, lng } = map.getCenter();
             const params = new URLSearchParams(window.location.search);
@@ -161,138 +160,111 @@ function MapPage() {
             params.set("zoom", map.getZoom().toFixed(2));
             window.history.replaceState({}, "", `${window.location.pathname}?${params}`);
         };
-
         map.on("moveend", onMove);
         return () => { map.off("moveend", onMove); };
     }, [map]);
 
-    // ✅ Data Fetching: Runs ONLY ONCE to grab data instead of running on every theme swap
-    useEffect(() => {
-        const fetchMapData = async () => {
-            try {
-                const [bbRes, wpRes] = await Promise.all([
-                    fetch("/api/boundingboxes").catch(() => null),
-                    fetch("/api/waypoints").catch(() => null),
-                ]);
+    const drawLayers = useCallback(() => {
+        const m = mapRef.current;
+        if (!m) return;
 
-                console.info("[Map] API status", {
-                    boundingboxes: bbRes?.status ?? "failed",
-                    waypoints: wpRes?.status ?? "failed",
-                });
-
-                if (bbRes && bbRes.ok) {
-                    const bbData = await bbRes.json();
-                    boundingBoxesRef.current = bbData.boundingBoxes ?? [];
-                }
-
-                if (wpRes && wpRes.ok) {
-                    const wpData = await wpRes.json();
-                    const fetchedWaypoints: Waypoint[] = wpData.waypoints ?? [];
-                    setWaypoints(fetchedWaypoints); // Update state for search bar
-
-                    waypointGeojsonRef.current = {
-                        type: "FeatureCollection",
-                        features: fetchedWaypoints.map((wp) => ({
-                            type: "Feature",
-                            geometry: { type: "Point", coordinates: [wp.longitude, wp.latitude] },
-                            properties: wp,
-                        })),
-                    };
-                } else {
-                    toast.error("Failed to load waypoints");
-                }
-
-                // If map is already loaded by the time fetch finishes, trigger draw
-                if (map && map.isStyleLoaded()) {
-                    drawCustomLayers();
-                }
-            } catch (err) {
-                console.error("[Map] Error loading data", err);
-                toast.error("Error loading map data");
-            }
+        const retry = () => {
+            if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+            retryTimerRef.current = window.setTimeout(() => {
+                retryTimerRef.current = null;
+                drawLayers();
+            }, 50);
         };
 
-        fetchMapData();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [map]); // Runs when map instantiates
+        if (!m.isStyleLoaded()) {
+            retry();
+            return;
+        }
 
-    // ✅ Layer Rendering logic entirely separated from data fetching
-    const drawCustomLayers = useCallback(() => {
-        if (!map || !map.isStyleLoaded()) return;
+        try {
+            // --- Bounding boxes ---
+            for (const box of boundingBoxesRef.current) {
+                const ring = normalizeBoundingBoxRing(box.coordinates);
+                if (!ring) continue;
 
-        // --- Render Bounding Boxes ---
-        boundingBoxesRef.current.forEach((box) => {
-            const normalizedRing = normalizeBoundingBoxRing(box.coordinates);
-            if (!normalizedRing) return;
+                const srcId = `bbox-${box.id}`;
+                const geojson: GeoJSON.FeatureCollection = {
+                    type: "FeatureCollection",
+                    features: [{ type: "Feature", geometry: { type: "Polygon", coordinates: [ring] }, properties: box }],
+                };
 
-            const boxId = `bbox-${box.id}`;
-            const geojson: GeoJSON.FeatureCollection = {
-                type: "FeatureCollection",
-                features: [{ type: "Feature", geometry: { type: "Polygon", coordinates: [normalizedRing] }, properties: box }],
-            };
+                if (m.getSource(srcId)) {
+                    (m.getSource(srcId) as GeoJSONSource).setData(geojson);
+                } else {
+                    m.addSource(srcId, { type: "geojson", data: geojson });
+                }
 
-            if (!map.getSource(boxId)) {
-                map.addSource(boxId, { type: "geojson", data: geojson });
-            }
-
-            if (!map.getLayer(`${boxId}-fill`)) {
-                map.addLayer({
-                    id: `${boxId}-fill`,
-                    type: "fill",
-                    source: boxId,
-                    paint: { "fill-color": box.color ?? "#ff8c00", "fill-opacity": 0.14 },
-                });
-
-                // Attach events once to prevent memory leaks and duplication bugs
-                if (!initializedLayersRef.current.has(`${boxId}-fill`)) {
-                    initializedLayersRef.current.add(`${boxId}-fill`);
-                    let boxPopup: Popup | null = null;
-
-                    map.on("mouseenter", `${boxId}-fill`, (e) => {
-                        map.getCanvas().style.cursor = "pointer";
-                        boxPopup = new Popup({ closeButton: false, closeOnClick: false, offset: [0, -8] })
-                            .setLngLat(e.lngLat)
-                            .setHTML(`<div style="background:var(--background);color:var(--foreground);border:1px solid var(--border);padding:8px 12px;border-radius:8px;font-size:13px;font-weight:600;max-width:180px">${box.name}${box.description ? `<div style="font-size:11px;font-weight:400;color:var(--muted-foreground);margin-top:2px">${box.description}</div>` : ""}</div>`)
-                            .addTo(map);
+                if (!m.getLayer(`${srcId}-fill`)) {
+                    m.addLayer({
+                        id: `${srcId}-fill`,
+                        type: "fill",
+                        source: srcId,
+                        paint: { "fill-color": box.color ?? "#ff8c00", "fill-opacity": 0.14 },
                     });
+                }
 
-                    map.on("mousemove", `${boxId}-fill`, (e) => boxPopup?.setLngLat(e.lngLat));
-                    map.on("mouseleave", `${boxId}-fill`, () => {
-                        map.getCanvas().style.cursor = "";
-                        boxPopup?.remove();
-                        boxPopup = null;
+                if (!m.getLayer(`${srcId}-stroke`)) {
+                    m.addLayer({
+                        id: `${srcId}-stroke`,
+                        type: "line",
+                        source: srcId,
+                        paint: { "line-color": box.color ?? "#ff8c00", "line-width": 3, "line-opacity": 0.95, "line-dasharray": [2, 1.25] },
+                    });
+                }
+
+                // Re-register on every style load (registeredEventsRef is cleared on style.load)
+                if (!registeredEventsRef.current.has(srcId)) {
+                    registeredEventsRef.current.add(srcId);
+                    let hoverPopup: Popup | null = null;
+                    m.on("mouseenter", `${srcId}-fill`, (e) => {
+                        m.getCanvas().style.cursor = "pointer";
+                        hoverPopup = new Popup({ closeButton: false, closeOnClick: false, offset: [0, -8] })
+                            .setLngLat(e.lngLat)
+                            .setHTML(
+                                `<div style="background:var(--background);color:var(--foreground);border:1px solid var(--border);padding:8px 12px;border-radius:8px;font-size:13px;font-weight:600;max-width:180px">${box.name}${box.description ? `<div style="font-size:11px;font-weight:400;color:var(--muted-foreground);margin-top:2px">${box.description}</div>` : ""}</div>`,
+                            )
+                            .addTo(m);
+                    });
+                    m.on("mousemove", `${srcId}-fill`, (e) => hoverPopup?.setLngLat(e.lngLat));
+                    m.on("mouseleave", `${srcId}-fill`, () => {
+                        m.getCanvas().style.cursor = "";
+                        hoverPopup?.remove();
+                        hoverPopup = null;
                     });
                 }
             }
 
-            if (!map.getLayer(`${boxId}-stroke`)) {
-                map.addLayer({
-                    id: `${boxId}-stroke`,
-                    type: "line",
-                    source: boxId,
-                    paint: { "line-color": box.color ?? "#ff8c00", "line-width": 3, "line-opacity": 0.95, "line-dasharray": [2, 1.25] },
+            // --- Waypoints ---
+            const geojson = waypointGeojsonRef.current;
+            if (!geojson) return;
+
+            const wpSrc = m.getSource(WAYPOINTS_SOURCE_ID) as GeoJSONSource | undefined;
+            if (wpSrc) {
+                wpSrc.setData(geojson);
+            } else {
+                m.addSource(WAYPOINTS_SOURCE_ID, {
+                    type: "geojson",
+                    data: geojson,
+                    cluster: true,
+                    clusterMaxZoom: 14,
+                    clusterRadius: 50,
                 });
             }
-        });
 
-        // --- Render Waypoints ---
-        if (waypointGeojsonRef.current) {
-            const waypointSource = map.getSource(WAYPOINTS_SOURCE_ID) as GeoJSONSource | undefined;
-            if (waypointSource) {
-                waypointSource.setData(waypointGeojsonRef.current);
+            const heatSrc = m.getSource(WAYPOINTS_HEAT_SOURCE_ID) as GeoJSONSource | undefined;
+            if (heatSrc) {
+                heatSrc.setData(geojson);
             } else {
-                map.addSource(WAYPOINTS_SOURCE_ID, { type: "geojson", data: waypointGeojsonRef.current, cluster: true, clusterMaxZoom: 14, clusterRadius: 50 });
+                m.addSource(WAYPOINTS_HEAT_SOURCE_ID, { type: "geojson", data: geojson });
             }
 
-            const heatmapSource = map.getSource(WAYPOINTS_HEAT_SOURCE_ID) as GeoJSONSource | undefined;
-            if (heatmapSource) {
-                heatmapSource.setData(waypointGeojsonRef.current);
-            } else {
-                map.addSource(WAYPOINTS_HEAT_SOURCE_ID, { type: "geojson", data: waypointGeojsonRef.current });
-            }
-
-            if (!map.getLayer(WAYPOINTS_HEAT_LAYER_ID)) {
-                map.addLayer({
+            if (!m.getLayer(WAYPOINTS_HEAT_LAYER_ID)) {
+                m.addLayer({
                     id: WAYPOINTS_HEAT_LAYER_ID,
                     type: "heatmap",
                     source: WAYPOINTS_HEAT_SOURCE_ID,
@@ -307,129 +279,158 @@ function MapPage() {
                 });
             }
 
-            if (!map.getLayer(WAYPOINTS_CLUSTERS_LAYER_ID)) {
-                map.addLayer({
+            if (!m.getLayer(WAYPOINTS_CLUSTERS_LAYER_ID)) {
+                m.addLayer({
                     id: WAYPOINTS_CLUSTERS_LAYER_ID,
                     type: "circle",
                     source: WAYPOINTS_SOURCE_ID,
                     filter: ["has", "point_count"],
-                    paint: { "circle-color": "#2563eb", "circle-radius": ["step", ["get", "point_count"], 16, 10, 22, 50, 28], "circle-stroke-width": 3, "circle-stroke-color": "rgba(37,99,235,0.25)" },
+                    paint: {
+                        "circle-color": "#2563eb",
+                        "circle-radius": ["step", ["get", "point_count"], 16, 10, 22, 50, 28],
+                        "circle-stroke-width": 3,
+                        "circle-stroke-color": "rgba(37,99,235,0.25)",
+                    },
                 });
             }
 
-            if (!map.getLayer(WAYPOINTS_UNCLUSTERED_LAYER_ID)) {
-                map.addLayer({
+            if (!m.getLayer(WAYPOINTS_UNCLUSTERED_LAYER_ID)) {
+                m.addLayer({
                     id: WAYPOINTS_UNCLUSTERED_LAYER_ID,
                     type: "circle",
                     source: WAYPOINTS_SOURCE_ID,
                     filter: ["!", ["has", "point_count"]],
                     paint: { "circle-color": "#2563eb", "circle-radius": 6, "circle-stroke-width": 2, "circle-stroke-color": "#ffffff" },
                 });
+            }
 
-                // Attach Waypoint events only once
-                if (!initializedLayersRef.current.has("waypoints-events")) {
-                    initializedLayersRef.current.add("waypoints-events");
-
-                    map.on("click", WAYPOINTS_CLUSTERS_LAYER_ID, (e) => {
-                        const features = map.queryRenderedFeatures(e.point, { layers: [WAYPOINTS_CLUSTERS_LAYER_ID] });
-                        const clusterSource = map.getSource(WAYPOINTS_SOURCE_ID) as GeoJSONSource;
-                        if (!clusterSource || !features.length) return;
-
-                        clusterSource.getClusterExpansionZoom(features[0]?.properties.cluster_id)
-                            .then((zoom: number) => {
-                                map.easeTo({
-                                    center: (features[0]?.geometry as GeoJSON.Point).coordinates as [number, number],
-                                    zoom, duration: 400,
-                                });
-                            }).catch(() => { });
+            if (!m.getLayer(WAYPOINTS_CLUSTER_COUNT_LAYER_ID)) {
+                try {
+                    m.addLayer({
+                        id: WAYPOINTS_CLUSTER_COUNT_LAYER_ID,
+                        type: "symbol",
+                        source: WAYPOINTS_SOURCE_ID,
+                        filter: ["has", "point_count"],
+                        layout: { "text-field": "{point_count_abbreviated}", "text-font": ["Arial Unicode MS Bold"], "text-size": 11 },
+                        paint: { "text-color": "#ffffff" },
                     });
-
-                    map.on("click", WAYPOINTS_UNCLUSTERED_LAYER_ID, (e) => {
-                        const features = map.queryRenderedFeatures(e.point, { layers: [WAYPOINTS_UNCLUSTERED_LAYER_ID] });
-                        if (!features.length) return;
-                        const coords = (features[0]?.geometry as GeoJSON.Point).coordinates.slice() as [number, number];
-                        while (Math.abs(e.lngLat.lng - coords[0]) > 180) {
-                            coords[0] += e.lngLat.lng > coords[0] ? 360 : -360;
-                        }
-                        const rawId = (features[0]?.properties as { id?: unknown })?.id;
-                        const waypointId = typeof rawId === "number" ? rawId : Number(rawId);
-                        if (!Number.isFinite(waypointId)) return;
-                        openPopup(coords, waypointId);
-                    });
-
-                    map.on("mouseenter", WAYPOINTS_CLUSTERS_LAYER_ID, () => { map.getCanvas().style.cursor = "pointer"; });
-                    map.on("mouseleave", WAYPOINTS_CLUSTERS_LAYER_ID, () => { map.getCanvas().style.cursor = ""; });
-                    map.on("mouseenter", WAYPOINTS_UNCLUSTERED_LAYER_ID, () => { map.getCanvas().style.cursor = "pointer"; });
-                    map.on("mouseleave", WAYPOINTS_UNCLUSTERED_LAYER_ID, () => { map.getCanvas().style.cursor = ""; });
+                } catch {
+                    // Glyphs may not be loaded yet; will succeed on next style.load
                 }
             }
 
-            if (!map.getLayer(WAYPOINTS_CLUSTER_COUNT_LAYER_ID) && map.getStyle()?.glyphs) {
-                map.addLayer({
-                    id: WAYPOINTS_CLUSTER_COUNT_LAYER_ID,
-                    type: "symbol",
-                    source: WAYPOINTS_SOURCE_ID,
-                    filter: ["has", "point_count"],
-                    layout: { "text-field": "{point_count_abbreviated}", "text-font": ["Arial Unicode MS Bold"], "text-size": 11 },
-                    paint: { "text-color": "#ffffff" },
+            // Register waypoint interaction events once per style load
+            if (!registeredEventsRef.current.has("waypoints")) {
+                registeredEventsRef.current.add("waypoints");
+
+                m.on("click", WAYPOINTS_CLUSTERS_LAYER_ID, (e) => {
+                    const features = m.queryRenderedFeatures(e.point, { layers: [WAYPOINTS_CLUSTERS_LAYER_ID] });
+                    const src = m.getSource(WAYPOINTS_SOURCE_ID) as GeoJSONSource;
+                    if (!src || !features[0]) return;
+                    src.getClusterExpansionZoom(features[0].properties.cluster_id)
+                        .then((zoom: number) => {
+                            m.easeTo({ center: (features[0]?.geometry as GeoJSON.Point).coordinates as [number, number], zoom, duration: 400 });
+                        })
+                        .catch(() => {});
                 });
+
+                m.on("click", WAYPOINTS_UNCLUSTERED_LAYER_ID, (e) => {
+                    const features = m.queryRenderedFeatures(e.point, { layers: [WAYPOINTS_UNCLUSTERED_LAYER_ID] });
+                    if (!features[0]) return;
+                    const coords = (features[0].geometry as GeoJSON.Point).coordinates.slice() as [number, number];
+                    while (Math.abs(e.lngLat.lng - coords[0]) > 180) {
+                        coords[0] += e.lngLat.lng > coords[0] ? 360 : -360;
+                    }
+                    const rawId = (features[0].properties as { id?: unknown })?.id;
+                    const id = typeof rawId === "number" ? rawId : Number(rawId);
+                    if (!Number.isFinite(id)) return;
+                    openPopup(coords, id);
+                });
+
+                m.on("mouseenter", WAYPOINTS_CLUSTERS_LAYER_ID, () => { m.getCanvas().style.cursor = "pointer"; });
+                m.on("mouseleave", WAYPOINTS_CLUSTERS_LAYER_ID, () => { m.getCanvas().style.cursor = ""; });
+                m.on("mouseenter", WAYPOINTS_UNCLUSTERED_LAYER_ID, () => { m.getCanvas().style.cursor = "pointer"; });
+                m.on("mouseleave", WAYPOINTS_UNCLUSTERED_LAYER_ID, () => { m.getCanvas().style.cursor = ""; });
             }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes("Style is not done loading")) {
+                retry();
+                return;
+            }
+            throw err;
         }
-    }, [map, openPopup]);
+    }, [openPopup]);
 
-    // ✅ Style Event Listener
+    // Fetch data once on mount — never refetches on theme change
     useEffect(() => {
-        if (!map) return;
-
-        // Fired ONLY when a new theme is 100% applied and ready
-        const handleStyleLoad = async () => {
+        const load = async () => {
             try {
                 const [bbRes, wpRes] = await Promise.all([
                     fetch("/api/boundingboxes").catch(() => null),
                     fetch("/api/waypoints").catch(() => null),
                 ]);
 
-                console.info("[Map] style.load refetch status", {
-                    boundingboxes: bbRes?.status ?? "failed",
-                    waypoints: wpRes?.status ?? "failed",
-                });
-
-                if (bbRes && bbRes.ok) {
-                    const bbData = await bbRes.json();
-                    boundingBoxesRef.current = bbData.boundingBoxes ?? [];
+                if (bbRes?.ok) {
+                    const { boundingBoxes } = await bbRes.json();
+                    boundingBoxesRef.current = boundingBoxes ?? [];
                 }
 
-                if (wpRes && wpRes.ok) {
-                    const wpData = await wpRes.json();
-                    const fetchedWaypoints: Waypoint[] = wpData.waypoints ?? [];
-                    setWaypoints(fetchedWaypoints);
-
+                if (wpRes?.ok) {
+                    const { waypoints: wps } = await wpRes.json();
+                    const list: Waypoint[] = wps ?? [];
+                    setWaypoints(list);
                     waypointGeojsonRef.current = {
                         type: "FeatureCollection",
-                        features: fetchedWaypoints.map((wp) => ({
+                        features: list.map((wp) => ({
                             type: "Feature",
                             geometry: { type: "Point", coordinates: [wp.longitude, wp.latitude] },
                             properties: wp,
                         })),
                     };
+                } else if (wpRes) {
+                    toast.error("Failed to load waypoints");
                 }
-            } catch (err) {
-                console.error("[Map] style.load refetch failed", err);
-            }
 
-            drawCustomLayers();
+                dataReadyRef.current = true;
+                if (mapRef.current?.isStyleLoaded()) drawLayers();
+            } catch {
+                toast.error("Error loading map data");
+            }
         };
 
-        map.on("style.load", handleStyleLoad);
+        load();
+    }, [drawLayers]);
 
-        // Run immediately in case the style is already loaded on first mount
-        if (map.isStyleLoaded()) {
-            handleStyleLoad();
-        }
+    // Register style.load — redraws from cache on theme switch, no refetch
+    useEffect(() => {
+        if (!map) return;
 
-        return () => { map.off("style.load", handleStyleLoad); };
-    }, [map, drawCustomLayers]);
+        const onStyleLoad = () => {
+            // Clear so event listeners re-attach to the freshly loaded style's layers
+            registeredEventsRef.current = new Set();
+            if (dataReadyRef.current) drawLayers();
+        };
 
+        const onStyleImageMissing = (e: { id?: string }) => {
+            if (!e.id || map.hasImage(e.id) || e.id.trim().length > 0) return;
+            map.addImage(e.id, { width: 1, height: 1, data: new Uint8Array([0, 0, 0, 0]) });
+        };
+
+        map.on("style.load", onStyleLoad);
+        map.on("styleimagemissing", onStyleImageMissing);
+
+        if (map.isStyleLoaded() && dataReadyRef.current) drawLayers();
+
+        return () => {
+            map.off("style.load", onStyleLoad);
+            map.off("styleimagemissing", onStyleImageMissing);
+            if (retryTimerRef.current) {
+                window.clearTimeout(retryTimerRef.current);
+                retryTimerRef.current = null;
+            }
+        };
+    }, [map, drawLayers]);
 
     if (!mounted || !mapCenter) {
         return <div className="w-screen h-[100dvh] bg-muted" />;
@@ -443,17 +444,18 @@ function MapPage() {
                 zoom={mapZoom}
                 showControls={false}
                 className="w-full h-full"
-                onMapLoad={setMap}
+                onMapLoad={handleMapLoad}
             />
 
             <div className="absolute top-4 left-4 z-20">
                 <SearchBar
                     waypoints={waypoints}
-                    onSelect={w => {
-                        if (!map) return;
+                    onSelect={(w) => {
+                        const m = mapRef.current;
+                        if (!m) return;
                         if (!Number.isFinite(w.longitude) || !Number.isFinite(w.latitude) || !Number.isFinite(w.id)) return;
                         activePopup?.remove();
-                        map.flyTo({ center: [w.longitude, w.latitude], zoom: 18, duration: 600 });
+                        m.flyTo({ center: [w.longitude, w.latitude], zoom: 18, duration: 600 });
                         setTimeout(() => openPopup([w.longitude, w.latitude], w.id), 650);
                     }}
                 />
